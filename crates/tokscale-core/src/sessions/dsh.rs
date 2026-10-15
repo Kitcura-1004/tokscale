@@ -271,13 +271,21 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                 pending_user_turn = true;
             }
             "step/start" => {
-                if let (Some(turn), Some(step), Some(started)) = (
+                if let (Some(turn), Some(step)) = (
                     value.pointer("/data/turn").and_then(Value::as_i64),
                     value.pointer("/data/step").and_then(Value::as_i64),
-                    value.get("time").and_then(Value::as_i64),
                 ) {
-                    if started > 0 {
-                        step_started.insert((turn, step), started);
+                    let slot = (turn, step);
+                    if let Some(started) = value
+                        .get("time")
+                        .and_then(Value::as_i64)
+                        .filter(|started| *started > 0)
+                    {
+                        step_started.insert(slot, started);
+                    } else {
+                        // A malformed new boundary must not leave an older
+                        // call's clock attached to this slot.
+                        step_started.remove(&slot);
                     }
                 }
             }
@@ -287,13 +295,19 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                 // A retry is a second provider call for the same step, so it
                 // gets its own clock. Re-anchoring here keeps its latency from
                 // being charged to the span the failed call already used.
-                if let (Some(turn), Some(step), Some(started)) = (
-                    retry_turn,
-                    retry_step,
-                    value.get("time").and_then(Value::as_i64),
-                ) {
-                    if started > 0 {
-                        step_started.insert((turn, step), started);
+                if let (Some(turn), Some(step)) = (retry_turn, retry_step) {
+                    let slot = (turn, step);
+                    if let Some(started) = value
+                        .get("time")
+                        .and_then(Value::as_i64)
+                        .filter(|started| *started > 0)
+                    {
+                        step_started.insert(slot, started);
+                    } else {
+                        // The retry is still a separate call, but without its
+                        // own clock it must stay untimed rather than inherit
+                        // the failed call's anchor.
+                        step_started.remove(&slot);
                     }
                 }
                 if last_settlement.is_some_and(|(turn, step, _)| {
@@ -371,6 +385,11 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                 } else {
                     timestamp
                 };
+                // Treat the start and duration as one validated span. A bad
+                // future anchor must not re-date an otherwise untimed message.
+                let duration_ms = started_at
+                    .and_then(|anchor| duration_between_ms(Some(anchor), Some(settled_at)));
+                let message_timestamp = duration_ms.and(started_at).unwrap_or(timestamp);
 
                 let source = value.pointer("/data/message/source");
                 let model_id = served_model(source)
@@ -507,7 +526,7 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                     model_id,
                     provider_id,
                     &sid,
-                    started_at.unwrap_or(timestamp),
+                    message_timestamp,
                     tokens,
                     0.0,
                     Some(dedup_key),
@@ -528,9 +547,7 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                     // The span is the one the call actually occupied: the
                     // message was dated at its anchor above, and the duration
                     // closes it where the charged usage was written.
-                    if let Some(anchor) = started_at {
-                        message.duration_ms = duration_between_ms(Some(anchor), Some(settled_at));
-                    }
+                    message.duration_ms = duration_ms;
                     if let Some((last_turn, last_step, index)) = last_settlement {
                         if last_turn == turn && last_step == step {
                             // This settlement is another sample for the same
@@ -926,6 +943,40 @@ mod tests {
             messages[0].dedup_key.as_deref(),
             Some("dsh:seq:11:1786669451200:irix:deepseek-v4-flash:130:159:0:0:0")
         );
+    }
+
+    #[test]
+    fn invalid_boundaries_leave_settlements_untimed_at_their_own_clock() {
+        let file = write_zstd_session(&[
+            r#"{"type":"session","id":"session-invalid-clocks","createdAt":1,"cwd":"/work"}"#,
+            // A future anchor cannot describe a positive span. The settlement
+            // must retain its own clock instead of moving into the future.
+            r#"{"type":"step/start","seq":1,"time":1786669451000,"data":{"turn":1,"step":1}}"#,
+            r#"{"type":"assistant/message","seq":2,"time":1786669450000,"data":{"turn":1,"step":1,"message":{"source":{"provider":"irix","model":"deepseek-v4-flash"}},"usage":{"inputTokens":10,"outputTokens":20}}}"#,
+            // A retry without a usable clock is still a separate call, but it
+            // must not inherit the failed call's anchor and overlap its span.
+            r#"{"type":"step/start","seq":3,"time":1786669460000,"data":{"turn":2,"step":1}}"#,
+            r#"{"type":"assistant/message","seq":4,"time":1786669460500,"data":{"turn":2,"step":1,"message":{"source":{"provider":"irix","model":"deepseek-v4-flash"}},"usage":{"inputTokens":30,"outputTokens":40}}}"#,
+            r#"{"type":"llm/retry-started","seq":5,"data":{"turn":2,"step":1,"retry":1,"retryId":"retry-without-clock"}}"#,
+            r#"{"type":"assistant/message","seq":6,"time":1786669461000,"data":{"turn":2,"step":1,"message":{"source":{"provider":"irix","model":"deepseek-v4-flash"}},"usage":{"inputTokens":50,"outputTokens":60}}}"#,
+            // An unusable later step boundary also clears the older clock for
+            // the same slot instead of silently reusing it.
+            r#"{"type":"step/start","seq":7,"time":1786669470000,"data":{"turn":3,"step":1}}"#,
+            r#"{"type":"step/start","seq":8,"time":0,"data":{"turn":3,"step":1}}"#,
+            r#"{"type":"assistant/message","seq":9,"time":1786669471000,"data":{"turn":3,"step":1,"message":{"source":{"provider":"irix","model":"deepseek-v4-flash"}},"usage":{"inputTokens":70,"outputTokens":80}}}"#,
+        ]);
+
+        let messages = parse_dsh_file(file.path());
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].timestamp, 1786669450000);
+        assert_eq!(messages[0].duration_ms, None);
+        assert_eq!(messages[1].timestamp, 1786669460000);
+        assert_eq!(messages[1].duration_ms, Some(500));
+        assert_eq!(messages[2].timestamp, 1786669461000);
+        assert_eq!(messages[2].duration_ms, None);
+        assert_eq!(messages[3].timestamp, 1786669471000);
+        assert_eq!(messages[3].duration_ms, None);
     }
 
     #[test]
